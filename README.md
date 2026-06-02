@@ -10,6 +10,21 @@ claude --settings <temporary-settings-file>
 
 This mirrors CC Switch's "Open Terminal" behavior without opening the GUI.
 
+## Platform support
+
+Supported shells and platforms:
+
+- macOS + zsh
+- macOS + bash
+- Linux + zsh
+- Linux + bash
+
+The CLI defaults to `~/.cc-switch/cc-switch.db`. If your CC Switch database lives elsewhere, set:
+
+```bash
+export CCS_DB=/path/to/cc-switch.db
+```
+
 ## Usage
 
 List Claude providers:
@@ -40,19 +55,39 @@ From this repository:
 
 ```bash
 ./install.sh
+```
+
+Install for a specific shell:
+
+```bash
+./install.sh --shell zsh
+./install.sh --shell bash
+./install.sh --shell both
+```
+
+Install without completion:
+
+```bash
+./install.sh --no-completion
+```
+
+Then reload your shell configuration:
+
+```bash
 source ~/.zshrc
+# or
+source ~/.bashrc
 ```
 
 The installer copies:
 
 - `bin/ccs` to `~/.local/bin/ccs`
-- `completions/_ccs` to `~/.zsh/completions/_ccs`
-
-and ensures your `~/.zshrc` loads the completion directory.
+- zsh completion to `~/.zsh/completions/_ccs`
+- bash completion to `~/.local/share/bash-completion/completions/ccs`
 
 ## Completion
 
-After install and `source ~/.zshrc`:
+After install and shell reload:
 
 ```bash
 ccs b<Tab>
@@ -64,14 +99,17 @@ completes provider names. The second argument completes directories:
 ccs BUZZ <Tab>
 ```
 
+zsh completion shows provider metadata in descriptions. Bash completion completes provider names and directories.
+
 ## Requirements
 
-- macOS or Linux shell environment
-- `zsh` for completion
+- macOS or Linux
+- Bash 3.2+ for the CLI
 - `sqlite3`
 - `python3`
 - Claude Code CLI: `claude`
 - Optional: `fzf` for duplicate-name selection
+- Optional: zsh or bash completion support
 
 ## Security notes
 
