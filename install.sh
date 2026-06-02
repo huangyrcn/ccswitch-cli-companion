@@ -14,15 +14,15 @@ if [[ ! -f "$ZSHRC" ]]; then
   touch "$ZSHRC"
 fi
 
-if ! grep -q 'ccs-cli completion' "$ZSHRC"; then
+if ! grep -q 'ccswitch-cli-companion completion' "$ZSHRC"; then
   cat >> "$ZSHRC" <<'EOF'
 
-# ccs-cli completion
+# ccswitch-cli-companion completion
 export PATH="$HOME/.local/bin:$PATH"
 fpath=("$HOME/.zsh/completions" $fpath)
 autoload -Uz compinit
 compinit -i
-# end ccs-cli completion
+# end ccswitch-cli-companion completion
 EOF
 fi
 

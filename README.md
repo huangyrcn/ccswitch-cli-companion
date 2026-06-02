@@ -1,6 +1,6 @@
-# ccs-cli
+# ccswitch-cli-companion
 
-Launch Claude Code with CC Switch provider profiles from your terminal.
+A CLI companion for CC Switch that launches Claude Code with CC Switch provider profiles from your terminal.
 
 `ccs` reads Claude providers from `~/.cc-switch/cc-switch.db`, creates a temporary Claude Code settings file with that provider's environment, then runs:
 
