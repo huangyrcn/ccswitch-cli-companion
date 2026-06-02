@@ -1,0 +1,38 @@
+#compdef ccs
+
+# Zsh completion for ccs.
+# Hidden test/helper mode:
+#   completions/_ccs --rows
+# prints the same provider rows used by completion.
+
+_ccs_rows() {
+  ccs --completion-rows 2>/dev/null
+}
+
+if [[ "${1:-}" == "--rows" ]]; then
+  _ccs_rows
+  return $?
+fi
+
+_ccs() {
+  if (( CURRENT == 2 )); then
+    local -a names descriptions
+    local line name current base_url sonnet opus
+
+    while IFS=$'\t' read -r name current base_url sonnet opus; do
+      [[ -n "$name" ]] || continue
+      names+=("$name")
+      descriptions+=("$current | $base_url | sonnet=$sonnet | opus=$opus")
+    done < <(_ccs_rows)
+
+    compadd -M 'm:{a-zA-Z}={A-Za-z}' -d descriptions -- "${names[@]}"
+    return
+  fi
+
+  if (( CURRENT >= 3 )); then
+    _files -/
+    return
+  fi
+}
+
+_ccs "$@"

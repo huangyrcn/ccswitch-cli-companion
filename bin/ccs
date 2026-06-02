@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DB="${CCS_DB:-$HOME/.cc-switch/cc-switch.db}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ccs
+  ccs <provider-name-or-id> [cwd]
+
+Commands:
+  ccs                         List Claude providers from CC Switch
+  ccs BUZZ                    Launch Claude Code with provider BUZZ
+  ccs BUZZ /path/to/project   Launch provider BUZZ in a working directory
+EOF
+}
+
+require_db() {
+  if [[ ! -f "$DB" ]]; then
+    echo "cc-switch database not found: $DB" >&2
+    return 1
+  fi
+}
+
+list_providers() {
+  require_db
+  sqlite3 -header -column "$DB" "
+    SELECT
+      id,
+      name,
+      is_current,
+      json_extract(settings_config, '$.env.ANTHROPIC_BASE_URL') AS base_url,
+      json_extract(settings_config, '$.env.ANTHROPIC_DEFAULT_SONNET_MODEL') AS sonnet,
+      json_extract(settings_config, '$.env.ANTHROPIC_DEFAULT_OPUS_MODEL') AS opus
+    FROM providers
+    WHERE app_type = 'claude'
+    ORDER BY COALESCE(sort_index, 999999), name;
+  "
+}
+
+completion_rows() {
+  require_db
+  python3 - "$DB" <<'PY'
+import sqlite3
+import sys
+
+_db = sys.argv[1]
+conn = sqlite3.connect(_db)
+conn.row_factory = sqlite3.Row
+rows = conn.execute(
+    """
+    SELECT
+      name,
+      is_current,
+      json_extract(settings_config, '$.env.ANTHROPIC_BASE_URL') AS base_url,
+      json_extract(settings_config, '$.env.ANTHROPIC_DEFAULT_SONNET_MODEL') AS sonnet,
+      json_extract(settings_config, '$.env.ANTHROPIC_DEFAULT_OPUS_MODEL') AS opus
+    FROM providers
+    WHERE app_type = 'claude'
+    ORDER BY COALESCE(sort_index, 999999), name
+    """
+).fetchall()
+
+def clean(value):
+    if value is None:
+        return ""
+    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+for row in rows:
+    current = "current" if row["is_current"] else "-"
+    print("\t".join([
+        clean(row["name"]),
+        current,
+        clean(row["base_url"]),
+        clean(row["sonnet"]),
+        clean(row["opus"]),
+    ]))
+PY
+}
+
+find_providers() {
+  local query="$1"
+  require_db
+  python3 - "$DB" "$query" <<'PY'
+import sqlite3
+import sys
+
+_db, query = sys.argv[1], sys.argv[2]
+conn = sqlite3.connect(_db)
+conn.row_factory = sqlite3.Row
+
+select_columns = """
+    SELECT
+      id,
+      name,
+      is_current,
+      json_extract(settings_config, '$.env.ANTHROPIC_BASE_URL') AS base_url,
+      json_extract(settings_config, '$.env.ANTHROPIC_DEFAULT_SONNET_MODEL') AS sonnet,
+      json_extract(settings_config, '$.env.ANTHROPIC_DEFAULT_OPUS_MODEL') AS opus
+    FROM providers
+"""
+order_by = " ORDER BY COALESCE(sort_index, 999999), name"
+
+# Prefer exact provider id. If no id matches, use exact provider name.
+rows = conn.execute(
+    select_columns + " WHERE app_type = 'claude' AND id = ?" + order_by,
+    (query,),
+).fetchall()
+
+if not rows:
+    rows = conn.execute(
+        select_columns + " WHERE app_type = 'claude' AND name = ?" + order_by,
+        (query,),
+    ).fetchall()
+
+# Convenience fallback: provider names are often typed with different case.
+if not rows:
+    rows = conn.execute(
+        select_columns + " WHERE app_type = 'claude' AND name = ? COLLATE NOCASE" + order_by,
+        (query,),
+    ).fetchall()
+
+def clean(value):
+    if value is None:
+        return ""
+    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+for row in rows:
+    current = "current" if row["is_current"] else "-"
+    print("\t".join([
+        clean(row["id"]),
+        clean(row["name"]),
+        current,
+        clean(row["base_url"]),
+        clean(row["sonnet"]),
+        clean(row["opus"]),
+    ]))
+PY
+}
+
+write_settings() {
+  local provider_id="$1"
+  require_db
+  python3 - "$DB" "$provider_id" <<'PY'
+import json
+import sqlite3
+import sys
+
+_db, provider_id = sys.argv[1], sys.argv[2]
+conn = sqlite3.connect(_db)
+row = conn.execute(
+    """
+    SELECT settings_config
+    FROM providers
+    WHERE app_type = 'claude' AND id = ?
+    LIMIT 1
+    """,
+    (provider_id,),
+).fetchone()
+
+if row is None:
+    print(f"Provider not found: {provider_id}", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    config = json.loads(row[0])
+except Exception as exc:
+    print(f"Invalid provider settings JSON: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+raw_env = config.get("env", {}) if isinstance(config, dict) else {}
+if not isinstance(raw_env, dict):
+    raw_env = {}
+
+# Match CC Switch GUI behavior: write only string env values from provider.settings_config.env.
+env = {str(key): value for key, value in raw_env.items() if isinstance(value, str)}
+print(json.dumps({"env": env}, ensure_ascii=False, indent=2))
+PY
+}
+
+select_provider() {
+  local query="$1"
+  local rows selected
+  rows="$(find_providers "$query")"
+
+  if [[ -z "$rows" ]]; then
+    echo "Claude provider not found: $query" >&2
+    echo "List providers with: ccs" >&2
+    return 1
+  fi
+
+  local -a matches
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && matches+=("$line")
+  done <<< "$rows"
+
+  if (( ${#matches[@]} == 1 )); then
+    printf '%s\n' "${matches[0]}"
+    return 0
+  fi
+
+  echo "Multiple Claude providers matched '$query'. Select one:" >&2
+  if command -v fzf >/dev/null 2>&1; then
+    selected="$(printf '%s\n' "${matches[@]}" | fzf \
+      --delimiter=$'\t' \
+      --with-nth=2,3,4,5,6,1 \
+      --header='name | current | base_url | sonnet | opus | id')" || return 1
+    printf '%s\n' "$selected"
+    return 0
+  fi
+
+  local index choice
+  for index in "${!matches[@]}"; do
+    line="${matches[$index]}"
+    IFS=$'\t' read -r provider_id provider_name current base_url sonnet opus <<< "$line"
+    printf '%d) %s | %s | base=%s | sonnet=%s | opus=%s | id=%s\n' \
+      "$((index + 1))" "$provider_name" "$current" "$base_url" "$sonnet" "$opus" "$provider_id" >&2
+  done
+
+  printf 'Choose provider number: ' >&2
+  read -r choice
+  if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#matches[@]} )); then
+    echo "Invalid choice: $choice" >&2
+    return 1
+  fi
+  printf '%s\n' "${matches[$((choice - 1))]}"
+}
+
+launch_provider() {
+  local query="$1"
+  local cwd="${2:-}"
+
+  local selected provider_id provider_name current base_url sonnet opus
+  selected="$(select_provider "$query")"
+  IFS=$'\t' read -r provider_id provider_name current base_url sonnet opus <<< "$selected"
+
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/claude_ccswitch_XXXXXX")"
+
+  if ! write_settings "$provider_id" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  if [[ ! -s "$tmp" ]]; then
+    echo "Failed to create Claude settings for provider: $provider_id" >&2
+    rm -f "$tmp"
+    return 1
+  fi
+
+  echo "Using provider: $provider_name ($provider_id)"
+  echo "Using provider-specific claude config:"
+  echo "$tmp"
+
+  local rc=0
+  if [[ -n "$cwd" ]]; then
+    (cd "$cwd" && claude --settings "$tmp") || rc=$?
+  else
+    claude --settings "$tmp" || rc=$?
+  fi
+  rm -f "$tmp"
+  return "$rc"
+}
+
+main() {
+  case "${1:-}" in
+    -h|--help)
+      usage
+      return 0
+      ;;
+    --completion-rows)
+      completion_rows
+      return 0
+      ;;
+    "")
+      list_providers
+      return 0
+      ;;
+    *)
+      launch_provider "$@"
+      ;;
+  esac
+}
+
+main "$@"
