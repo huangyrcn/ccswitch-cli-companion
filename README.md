@@ -1,14 +1,53 @@
 # ccswitch-cli-companion
 
-A CLI companion for CC Switch that launches Claude Code with CC Switch provider profiles from your terminal.
+A CLI companion for CC Switch that launches Claude Code or Codex with CC Switch provider profiles from your terminal.
 
-`ccs` reads Claude providers from `~/.cc-switch/cc-switch.db`, creates a temporary Claude Code settings file with that provider's environment, then runs:
+## Usage
+
+List Claude providers (default):
+
+```bash
+ccs
+```
+
+Launch a Claude provider by name or id:
+
+```bash
+ccs BUZZ
+ccs claude BUZZ
+```
+
+List Codex providers:
+
+```bash
+ccs codex
+```
+
+Launch a Codex provider:
+
+```bash
+ccs codex ai-pixel
+```
+
+If multiple providers share the same name, `ccs` uses `fzf` when available so you can choose with arrow keys. Without `fzf`, it falls back to a numbered prompt.
+
+## How it works
+
+**Claude** — reads `settings_config.env` from the provider, creates a temporary JSON settings file, and runs:
 
 ```bash
 claude --settings <temporary-settings-file>
 ```
 
-This mirrors CC Switch's "Open Terminal" behavior without opening the GUI.
+The temporary file is removed when Claude Code exits.
+
+**Codex** — reads `settings_config.auth` and `settings_config.config` from the provider, creates a temporary directory with `auth.json` and `config.toml`, and runs:
+
+```bash
+CODEX_HOME=<temporary-home> codex
+```
+
+The temporary directory is removed when Codex exits. This approach doesn't modify your real `~/.codex/` config, so multiple Codex instances with different providers can run in parallel.
 
 ## Platform support
 
@@ -24,30 +63,6 @@ The CLI defaults to `~/.cc-switch/cc-switch.db`. If your CC Switch database live
 ```bash
 export CCS_DB=/path/to/cc-switch.db
 ```
-
-## Usage
-
-List Claude providers:
-
-```bash
-ccs
-```
-
-Launch by provider name or id:
-
-```bash
-ccs BUZZ
-ccs ai-pixel
-ccs 0711c34d-45e0-45a1-9882-8a7b144f0beb
-```
-
-Launch in a specific working directory:
-
-```bash
-ccs BUZZ /Volumes/workspace/bio/HyperSD
-```
-
-If multiple providers share the same name, `ccs` uses `fzf` when available so you can choose with arrow keys. Without `fzf`, it falls back to a numbered prompt.
 
 ## Install
 
@@ -90,16 +105,12 @@ The installer copies:
 After install and shell reload:
 
 ```bash
-ccs b<Tab>
+ccs b<Tab>          # completes Claude provider names
+ccs codex <Tab>     # completes Codex provider names
+ccs claude <Tab>    # completes Claude provider names
 ```
 
-completes provider names. The second argument completes directories:
-
-```bash
-ccs BUZZ <Tab>
-```
-
-zsh completion shows provider metadata in descriptions. Bash completion completes provider names and directories.
+Zsh completion shows provider metadata in descriptions. Bash completion completes provider names with proper escaping for names containing spaces.
 
 ## Requirements
 
@@ -107,12 +118,10 @@ zsh completion shows provider metadata in descriptions. Bash completion complete
 - Bash 3.2+ for the CLI
 - `sqlite3`
 - `python3`
-- Claude Code CLI: `claude`
+- Claude Code CLI (`claude`) and/or Codex CLI (`codex`)
 - Optional: `fzf` for duplicate-name selection
 - Optional: zsh or bash completion support
 
 ## Security notes
 
-`ccs` does not print tokens. It writes provider env into a temporary settings file, then removes that file when Claude Code exits.
-
-The temporary settings file exists while `claude` is running, matching CC Switch's GUI launcher behavior.
+`ccs` does not print tokens or API keys in list output. It writes provider credentials into temporary files/directories, then removes them when the launched process exits.

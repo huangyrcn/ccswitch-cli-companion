@@ -3,16 +3,30 @@ set -euo pipefail
 
 DB="${CCS_DB:-$HOME/.cc-switch/cc-switch.db}"
 
+KNOWN_APP_TYPES="claude codex"
+
+is_known_app_type() {
+  local app="$1"
+  local t
+  for t in $KNOWN_APP_TYPES; do
+    [[ "$t" == "$app" ]] && return 0
+  done
+  return 1
+}
+
 usage() {
   cat <<'EOF'
 Usage:
-  ccs
-  ccs <provider-name-or-id> [cwd]
+  ccs                              List Claude providers (default)
+  ccs <provider>                   Launch Claude provider by name or id
+  ccs claude                       List Claude providers (explicit)
+  ccs claude <provider>            Launch Claude provider
+  ccs codex                        List Codex providers
+  ccs codex <provider>             Launch Codex provider
 
-Commands:
-  ccs                         List Claude providers from CC Switch
-  ccs BUZZ                    Launch Claude Code with provider BUZZ
-  ccs BUZZ /path/to/project   Launch provider BUZZ in a working directory
+Options:
+  -h, --help                       Show this help message
+  --completion-rows [--app <type>] Print completion data (internal)
 EOF
 }
 
@@ -23,29 +37,20 @@ require_db() {
   fi
 }
 
-list_providers() {
-  require_db
-  sqlite3 -header -column "$DB" "
-    SELECT
-      id,
-      name,
-      is_current,
-      json_extract(settings_config, '$.env.ANTHROPIC_BASE_URL') AS base_url,
-      json_extract(settings_config, '$.env.ANTHROPIC_DEFAULT_SONNET_MODEL') AS sonnet,
-      json_extract(settings_config, '$.env.ANTHROPIC_DEFAULT_OPUS_MODEL') AS opus
-    FROM providers
-    WHERE app_type = 'claude'
-    ORDER BY COALESCE(sort_index, 999999), name;
-  "
-}
+# ── List providers ──
 
-completion_rows() {
+list_providers() {
+  local app_type="${1:-claude}"
   require_db
-  python3 - "$DB" <<'PY'
+  local label
+  label="$(printf '%s' "$app_type" | cut -c1 | tr '[:lower:]' '[:upper:]')$(printf '%s' "$app_type" | cut -c2-)"
+  echo "${label} providers:"
+
+  python3 - "$DB" "$app_type" <<'PY'
 import sqlite3
 import sys
 
-_db = sys.argv[1]
+_db, app_type = sys.argv[1], sys.argv[2]
 conn = sqlite3.connect(_db)
 conn.row_factory = sqlite3.Row
 rows = conn.execute(
@@ -53,40 +58,143 @@ rows = conn.execute(
     SELECT
       name,
       is_current,
-      json_extract(settings_config, '$.env.ANTHROPIC_BASE_URL') AS base_url,
-      json_extract(settings_config, '$.env.ANTHROPIC_DEFAULT_SONNET_MODEL') AS sonnet,
-      json_extract(settings_config, '$.env.ANTHROPIC_DEFAULT_OPUS_MODEL') AS opus
+      CASE
+        WHEN app_type = 'claude' THEN json_extract(settings_config, '$.env.ANTHROPIC_BASE_URL')
+        WHEN app_type = 'codex' THEN
+          COALESCE(
+            json_extract(settings_config, '$.config'),
+            ''
+          )
+        ELSE ''
+      END AS detail
     FROM providers
-    WHERE app_type = 'claude'
+    WHERE app_type = ?
     ORDER BY COALESCE(sort_index, 999999), name
-    """
+    """,
+    (app_type,),
 ).fetchall()
 
-def clean(value):
+def clean(value, keep_newlines=False):
     if value is None:
         return ""
-    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    s = str(value).replace("\t", " ").replace("\r", " ")
+    if not keep_newlines:
+        s = s.replace("\n", " ")
+    return s
+
+for row in rows:
+    marker = "*" if row["is_current"] else " "
+    detail = clean(row["detail"], keep_newlines=(app_type == "codex"))
+    if not detail:
+        print(f"  {marker} {row['name']}")
+    elif app_type == "codex":
+        # For Codex: extract model and base_url from the config TOML text
+        model = ""
+        base_url = ""
+        for line in detail.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("model =") or (stripped.startswith("model ") and not stripped.startswith("model_")):
+                if not model:
+                    model = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+            elif stripped.startswith("base_url ="):
+                if not base_url:
+                    base_url = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+        parts = []
+        if model:
+            parts.append(f"model={model}")
+        if base_url:
+            parts.append(f"base_url={base_url}")
+        if parts:
+            print(f"  {marker} {row['name']:20s} {' '.join(parts)}")
+        else:
+            print(f"  {marker} {row['name']}")
+    else:
+        print(f"  {marker} {row['name']:20s} {detail}")
+PY
+}
+
+# ── Completion rows ──
+
+completion_rows() {
+  local app_type="${1:-claude}"
+  require_db
+  python3 - "$DB" "$app_type" <<'PY'
+import sqlite3
+import sys
+
+_db, app_type = sys.argv[1], sys.argv[2]
+conn = sqlite3.connect(_db)
+conn.row_factory = sqlite3.Row
+rows = conn.execute(
+    """
+    SELECT
+      name,
+      is_current,
+      CASE
+        WHEN app_type = 'claude' THEN json_extract(settings_config, '$.env.ANTHROPIC_BASE_URL')
+        WHEN app_type = 'codex' THEN
+          COALESCE(
+            json_extract(settings_config, '$.config'),
+            ''
+          )
+        ELSE ''
+      END AS detail
+    FROM providers
+    WHERE app_type = ?
+    ORDER BY COALESCE(sort_index, 999999), name
+    """,
+    (app_type,),
+).fetchall()
+
+def clean(value, keep_newlines=False):
+    if value is None:
+        return ""
+    s = str(value).replace("\t", " ").replace("\r", " ")
+    if not keep_newlines:
+        s = s.replace("\n", " ")
+    return s
 
 for row in rows:
     current = "current" if row["is_current"] else "-"
+    raw_detail = clean(row["detail"], keep_newlines=True)
+    detail = clean(row["detail"])
+    # For codex, extract model/base_url from the config TOML text
+    if app_type == "codex" and raw_detail:
+        model = ""
+        base_url = ""
+        for line in raw_detail.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("model =") or (stripped.startswith("model ") and not stripped.startswith("model_")):
+                if not model:
+                    model = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+            elif stripped.startswith("base_url ="):
+                if not base_url:
+                    base_url = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+        parts = []
+        if model:
+            parts.append(f"model={model}")
+        if base_url:
+            parts.append(f"base_url={base_url}")
+        detail = " ".join(parts) if parts else ""
     print("\t".join([
         clean(row["name"]),
         current,
-        clean(row["base_url"]),
-        clean(row["sonnet"]),
-        clean(row["opus"]),
+        detail,
     ]))
 PY
 }
 
+# ── Find providers ──
+
 find_providers() {
-  local query="$1"
+  local app_type="$1"
+  local query="$2"
   require_db
-  python3 - "$DB" "$query" <<'PY'
+  python3 - "$DB" "$app_type" "$query" <<'PY'
 import sqlite3
 import sys
 
-_db, query = sys.argv[1], sys.argv[2]
+_db, app_type, query = sys.argv[1], sys.argv[2], sys.argv[3]
 conn = sqlite3.connect(_db)
 conn.row_factory = sqlite3.Row
 
@@ -94,52 +202,96 @@ select_columns = """
     SELECT
       id,
       name,
-      is_current,
-      json_extract(settings_config, '$.env.ANTHROPIC_BASE_URL') AS base_url,
-      json_extract(settings_config, '$.env.ANTHROPIC_DEFAULT_SONNET_MODEL') AS sonnet,
-      json_extract(settings_config, '$.env.ANTHROPIC_DEFAULT_OPUS_MODEL') AS opus
+      is_current
     FROM providers
 """
 order_by = " ORDER BY COALESCE(sort_index, 999999), name"
+where_app = f" WHERE app_type = '{app_type}'"
 
-# Prefer exact provider id. If no id matches, use exact provider name.
+# Prefer exact provider id
 rows = conn.execute(
-    select_columns + " WHERE app_type = 'claude' AND id = ?" + order_by,
+    select_columns + where_app + " AND id = ?" + order_by,
     (query,),
 ).fetchall()
 
 if not rows:
     rows = conn.execute(
-        select_columns + " WHERE app_type = 'claude' AND name = ?" + order_by,
+        select_columns + where_app + " AND name = ?" + order_by,
         (query,),
     ).fetchall()
 
-# Convenience fallback: provider names are often typed with different case.
+# Fallback: case-insensitive name match
 if not rows:
     rows = conn.execute(
-        select_columns + " WHERE app_type = 'claude' AND name = ? COLLATE NOCASE" + order_by,
+        select_columns + where_app + " AND name = ? COLLATE NOCASE" + order_by,
         (query,),
     ).fetchall()
-
-def clean(value):
-    if value is None:
-        return ""
-    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
 
 for row in rows:
     current = "current" if row["is_current"] else "-"
     print("\t".join([
-        clean(row["id"]),
-        clean(row["name"]),
+        row["id"],
+        row["name"],
         current,
-        clean(row["base_url"]),
-        clean(row["sonnet"]),
-        clean(row["opus"]),
     ]))
 PY
 }
 
-write_settings() {
+select_provider() {
+  local app_type="$1"
+  local query="$2"
+  local label
+  label="$(printf '%s' "$app_type" | cut -c1 | tr '[:lower:]' '[:upper:]')$(printf '%s' "$app_type" | cut -c2-)"
+
+  local rows selected
+  rows="$(find_providers "$app_type" "$query")"
+
+  if [[ -z "$rows" ]]; then
+    echo "${label} provider not found: $query" >&2
+    echo "List providers with: ccs ${app_type}" >&2
+    return 1
+  fi
+
+  local -a matches
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && matches+=("$line")
+  done <<< "$rows"
+
+  if (( ${#matches[@]} == 1 )); then
+    printf '%s\n' "${matches[0]}"
+    return 0
+  fi
+
+  echo "Multiple ${label} providers matched '$query'. Select one:" >&2
+  if command -v fzf >/dev/null 2>&1; then
+    selected="$(printf '%s\n' "${matches[@]}" | fzf \
+      --delimiter=$'\t' \
+      --with-nth=2,3,1)" || return 1
+    printf '%s\n' "$selected"
+    return 0
+  fi
+
+  local index choice
+  for index in "${!matches[@]}"; do
+    line="${matches[$index]}"
+    IFS=$'\t' read -r provider_id provider_name current <<< "$line"
+    printf '%d) %s | %s | id=%s\n' \
+      "$((index + 1))" "$provider_name" "$current" "$provider_id" >&2
+  done
+
+  printf 'Choose provider number: ' >&2
+  read -r choice
+  if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#matches[@]} )); then
+    echo "Invalid choice: $choice" >&2
+    return 1
+  fi
+  printf '%s\n' "${matches[$((choice - 1))]}"
+}
+
+# ── Launch: Claude ──
+
+write_claude_settings() {
   local provider_id="$1"
   require_db
   python3 - "$DB" "$provider_id" <<'PY'
@@ -173,73 +325,21 @@ raw_env = config.get("env", {}) if isinstance(config, dict) else {}
 if not isinstance(raw_env, dict):
     raw_env = {}
 
-# Match CC Switch GUI behavior: write only string env values from provider.settings_config.env.
 env = {str(key): value for key, value in raw_env.items() if isinstance(value, str)}
 print(json.dumps({"env": env}, ensure_ascii=False, indent=2))
 PY
 }
 
-select_provider() {
+launch_claude() {
   local query="$1"
-  local rows selected
-  rows="$(find_providers "$query")"
-
-  if [[ -z "$rows" ]]; then
-    echo "Claude provider not found: $query" >&2
-    echo "List providers with: ccs" >&2
-    return 1
-  fi
-
-  local -a matches
-  local line
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && matches+=("$line")
-  done <<< "$rows"
-
-  if (( ${#matches[@]} == 1 )); then
-    printf '%s\n' "${matches[0]}"
-    return 0
-  fi
-
-  echo "Multiple Claude providers matched '$query'. Select one:" >&2
-  if command -v fzf >/dev/null 2>&1; then
-    selected="$(printf '%s\n' "${matches[@]}" | fzf \
-      --delimiter=$'\t' \
-      --with-nth=2,3,4,5,6,1 \
-      --header='name | current | base_url | sonnet | opus | id')" || return 1
-    printf '%s\n' "$selected"
-    return 0
-  fi
-
-  local index choice
-  for index in "${!matches[@]}"; do
-    line="${matches[$index]}"
-    IFS=$'\t' read -r provider_id provider_name current base_url sonnet opus <<< "$line"
-    printf '%d) %s | %s | base=%s | sonnet=%s | opus=%s | id=%s\n' \
-      "$((index + 1))" "$provider_name" "$current" "$base_url" "$sonnet" "$opus" "$provider_id" >&2
-  done
-
-  printf 'Choose provider number: ' >&2
-  read -r choice
-  if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#matches[@]} )); then
-    echo "Invalid choice: $choice" >&2
-    return 1
-  fi
-  printf '%s\n' "${matches[$((choice - 1))]}"
-}
-
-launch_provider() {
-  local query="$1"
-  local cwd="${2:-}"
-
-  local selected provider_id provider_name current base_url sonnet opus
-  selected="$(select_provider "$query")"
-  IFS=$'\t' read -r provider_id provider_name current base_url sonnet opus <<< "$selected"
+  local selected provider_id provider_name current
+  selected="$(select_provider "claude" "$query")"
+  IFS=$'\t' read -r provider_id provider_name current <<< "$selected"
 
   local tmp
   tmp="$(mktemp "${TMPDIR:-/tmp}/claude_ccswitch_XXXXXX")"
 
-  if ! write_settings "$provider_id" > "$tmp"; then
+  if ! write_claude_settings "$provider_id" > "$tmp"; then
     rm -f "$tmp"
     return 1
   fi
@@ -255,31 +355,148 @@ launch_provider() {
   echo "$tmp"
 
   local rc=0
-  if [[ -n "$cwd" ]]; then
-    (cd "$cwd" && claude --settings "$tmp") || rc=$?
-  else
-    claude --settings "$tmp" || rc=$?
-  fi
+  claude --settings "$tmp" || rc=$?
   rm -f "$tmp"
   return "$rc"
 }
 
+# ── Launch: Codex ──
+
+write_codex_config() {
+  local provider_id="$1"
+  local output_dir="$2"
+  require_db
+  python3 - "$DB" "$provider_id" "$output_dir" <<'PY'
+import json
+import sqlite3
+import sys
+import os
+
+_db, provider_id, output_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+conn = sqlite3.connect(_db)
+row = conn.execute(
+    """
+    SELECT settings_config
+    FROM providers
+    WHERE app_type = 'codex' AND id = ?
+    LIMIT 1
+    """,
+    (provider_id,),
+).fetchone()
+
+if row is None:
+    print(f"Codex provider not found: {provider_id}", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    config = json.loads(row[0])
+except Exception as exc:
+    print(f"Invalid provider settings JSON: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+if not isinstance(config, dict):
+    print("Invalid provider settings: expected JSON object", file=sys.stderr)
+    raise SystemExit(1)
+
+# Write auth.json
+raw_auth = config.get("auth", {})
+if not isinstance(raw_auth, dict):
+    raw_auth = {}
+auth = {str(k): v for k, v in raw_auth.items() if v is not None and v != ""}
+
+auth_path = os.path.join(output_dir, "auth.json")
+with open(auth_path, "w") as f:
+    json.dump(auth, f, ensure_ascii=False, indent=2)
+
+# Write config.toml
+raw_config = config.get("config", "")
+if raw_config is None:
+    raw_config = ""
+config_path = os.path.join(output_dir, "config.toml")
+with open(config_path, "w") as f:
+    f.write(raw_config if raw_config else "")
+
+print(json.dumps({"auth_path": auth_path, "config_path": config_path}))
+PY
+}
+
+launch_codex() {
+  local query="$1"
+  local selected provider_id provider_name current
+  selected="$(select_provider "codex" "$query")"
+  IFS=$'\t' read -r provider_id provider_name current <<< "$selected"
+
+  local tmp_home
+  tmp_home="$(mktemp -d "${TMPDIR:-/tmp}/codex_ccswitch_XXXXXX")"
+
+  if ! write_codex_config "$provider_id" "$tmp_home" >/dev/null; then
+    rm -rf "$tmp_home"
+    return 1
+  fi
+
+  echo "Using provider: $provider_name ($provider_id)"
+  echo "Using provider-specific codex home: $tmp_home"
+
+  local rc=0
+  CODEX_HOME="$tmp_home" codex || rc=$?
+  rm -rf "$tmp_home"
+  return "$rc"
+}
+
+# ── Main ──
+
 main() {
+  local app_type="claude"
+  local query=""
+
+  # Parse flags first
   case "${1:-}" in
     -h|--help)
       usage
       return 0
       ;;
     --completion-rows)
-      completion_rows
+      shift || true
+      if [[ "${1:-}" == "--app" && -n "${2:-}" ]]; then
+        completion_rows "$2"
+      else
+        completion_rows "claude"
+      fi
       return 0
       ;;
-    "")
-      list_providers
+  esac
+
+  # No args → list claude providers
+  if [[ $# -eq 0 ]]; then
+    list_providers "claude"
+    return 0
+  fi
+
+  # Check if first arg is a known app type
+  if is_known_app_type "$1"; then
+    app_type="$1"
+    shift
+    if [[ $# -eq 0 ]]; then
+      # "ccs claude" or "ccs codex" with no provider → list
+      list_providers "$app_type"
       return 0
+    fi
+    query="$1"
+  else
+    # First arg is a provider name → backward compatible: treat as claude
+    query="$1"
+  fi
+
+  case "$app_type" in
+    claude)
+      launch_claude "$query"
+      ;;
+    codex)
+      launch_codex "$query"
       ;;
     *)
-      launch_provider "$@"
+      echo "Unsupported app type: $app_type" >&2
+      return 1
       ;;
   esac
 }

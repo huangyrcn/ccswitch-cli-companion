@@ -2,37 +2,74 @@
 
 # Zsh completion for ccs.
 # Hidden test/helper mode:
-#   completions/_ccs --rows
+#   completions/_ccs --rows [--app <type>]
 # prints the same provider rows used by completion.
 
 _ccs_rows() {
-  ccs --completion-rows 2>/dev/null
+  local app="${1:-claude}"
+  ccs --completion-rows --app "$app" 2>/dev/null
 }
 
 if [[ "${1:-}" == "--rows" ]]; then
-  _ccs_rows
+  _ccs_rows "${2:-claude}"
   return $?
 fi
 
 _ccs() {
-  if (( CURRENT == 2 )); then
-    local -a names descriptions
-    local line name current base_url sonnet opus
+  local -a _ccs_app_types
+  _ccs_app_types=('claude:Launch with Claude provider' 'codex:Launch with Codex provider')
 
-    while IFS=$'\t' read -r name current base_url sonnet opus; do
+  if (( CURRENT == 2 )); then
+    # First argument: app type keywords + claude provider names (backward compat)
+    local -a names descriptions
+    local line name current detail
+
+    # Add app type keywords
+    _describe 'app type' _ccs_app_types
+
+    # Add claude provider names
+    while IFS=$'\t' read -r name current detail; do
       [[ -n "$name" ]] || continue
       names+=("$name")
-      descriptions+=("$current | $base_url | sonnet=$sonnet | opus=$opus")
-    done < <(_ccs_rows)
+      descriptions+=("$current | $detail")
+    done < <(_ccs_rows claude)
 
     compadd -M 'm:{a-zA-Z}={A-Za-z}' -d descriptions -- "${names[@]}"
     return
   fi
 
-  if (( CURRENT >= 3 )); then
-    _files -/
-    return
+  if (( CURRENT == 3 )); then
+    local word="${words[2]}"
+    case "$word" in
+      claude)
+        # Complete claude provider names
+        local -a names descriptions
+        local line name current detail
+        while IFS=$'\t' read -r name current detail; do
+          [[ -n "$name" ]] || continue
+          names+=("$name")
+          descriptions+=("$current | $detail")
+        done < <(_ccs_rows claude)
+        compadd -M 'm:{a-zA-Z}={A-Za-z}' -d descriptions -- "${names[@]}"
+        return
+        ;;
+      codex)
+        # Complete codex provider names
+        local -a names descriptions
+        local line name current detail
+        while IFS=$'\t' read -r name current detail; do
+          [[ -n "$name" ]] || continue
+          names+=("$name")
+          descriptions+=("$current | $detail")
+        done < <(_ccs_rows codex)
+        compadd -M 'm:{a-zA-Z}={A-Za-z}' -d descriptions -- "${names[@]}"
+        return
+        ;;
+    esac
   fi
+
+  # No more completions
+  return
 }
 
 _ccs "$@"
