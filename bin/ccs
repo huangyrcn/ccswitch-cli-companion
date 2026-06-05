@@ -23,6 +23,10 @@ Usage:
   ccs claude <provider>            Launch Claude provider
   ccs codex                        List Codex providers
   ccs codex <provider>             Launch Codex provider
+  ccs codex-sync-sessions [provider] [--dry-run]
+                                   Flip all Codex sessions (state DB + rollout
+                                   JSONL) to a provider so Codex/Desktop shows
+                                   the full history under that provider
 
 Options:
   -h, --help                       Show this help message
@@ -443,6 +447,141 @@ launch_codex() {
   return "$rc"
 }
 
+# Resolve the model_provider id Codex's picker filters by, given a config.toml.
+# Mirrors Codex: explicit `model_provider` line, else default "openai".
+codex_provider_filter() {
+  local config_toml="$1" value=""
+  if [[ -f "$config_toml" ]]; then
+    value="$(grep -E '^[[:space:]]*model_provider[[:space:]]*=' "$config_toml" 2>/dev/null | head -n1 | sed -E 's/^[^=]*=[[:space:]]*//; s/^["'\'']//; s/["'\''][[:space:]]*$//' || true)"
+  fi
+  echo "${value:-openai}"
+}
+
+# Flip every non-archived thread to the given provider in BOTH the state DB and
+# each thread's rollout JSONL (session_meta.model_provider). Rewriting the JSONL
+# is what makes the change survive Codex's backfill, which re-reads JSONL and
+# would otherwise overwrite the DB. Each rewritten JSONL is backed up to
+# "<file>.ccs-bak" once. Pass dry_run=1 to report without writing.
+flip_codex_provider() {
+  local state_db="$1" target="$2" dry_run="${3:-0}"
+  [[ -e "$state_db" ]] || return 0
+  python3 - "$state_db" "$target" "$dry_run" <<'PY'
+import sqlite3, sys, json, os, shutil
+
+state_db, target, dry_run = sys.argv[1], sys.argv[2], int(sys.argv[3])
+conn = sqlite3.connect(state_db)
+conn.row_factory = sqlite3.Row
+
+rows = conn.execute(
+    "SELECT id, rollout_path FROM threads WHERE model_provider != ?", (target,)
+).fetchall()
+if not rows:
+    print(f"All sessions already on '{target}'. Nothing to flip.")
+    sys.exit(0)
+
+print(f"{'Would flip' if dry_run else 'Flipping'} {len(rows)} session(s) -> '{target}'.")
+
+def flip_jsonl(path):
+    """Rewrite only session_meta.model_provider; leave every other byte intact."""
+    if not path or not os.path.exists(path):
+        return False
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    changed = False
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except Exception:
+            continue
+        payload = obj.get("payload") if isinstance(obj, dict) else None
+        if obj.get("type") == "session_meta" and isinstance(payload, dict) \
+                and payload.get("model_provider") not in (None, target):
+            payload["model_provider"] = target
+            lines[i] = json.dumps(obj, ensure_ascii=False) + "\n"
+            changed = True
+        break  # session_meta is always the first non-empty line
+    if changed and not dry_run:
+        if not os.path.exists(path + ".ccs-bak"):
+            shutil.copy2(path, path + ".ccs-bak")
+        tmp = path + ".ccs-tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        os.replace(tmp, path)
+    return changed
+
+jsonl_changed = 0
+for row in rows:
+    if flip_jsonl(row["rollout_path"]):
+        jsonl_changed += 1
+
+if not dry_run:
+    conn.execute("UPDATE threads SET model_provider = ? WHERE model_provider != ?", (target, target))
+    conn.commit()
+
+print(f"  state DB: {'would update' if dry_run else 'updated'} {len(rows)} row(s)")
+print(f"  rollout JSONL: {'would rewrite' if dry_run else 'rewrote'} {jsonl_changed} file(s)")
+PY
+}
+
+# ── Codex session sync (flip all threads to the active provider) ──
+
+sync_codex_sessions() {
+  local dry_run=0 target="" arg
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run) dry_run=1 ;;
+      *) target="$arg" ;;
+    esac
+  done
+
+  local codex_home state_db config_toml
+  codex_home="$(codex_home_dir)"
+  state_db="$codex_home/state_5.sqlite"
+  config_toml="$codex_home/config.toml"
+
+  if [[ ! -f "$state_db" ]]; then
+    echo "Codex state DB not found: $state_db" >&2
+    return 1
+  fi
+
+  # Target provider: explicit arg, else whatever Codex's picker filters by.
+  if [[ -z "$target" ]]; then
+    target="$(codex_provider_filter "$config_toml")"
+  fi
+  echo "Target provider: $target"
+
+  if [[ "$dry_run" -eq 0 ]]; then
+    cp "$state_db" "$state_db.ccs-bak"
+    echo "Backup: $state_db.ccs-bak"
+  fi
+
+  flip_codex_provider "$state_db" "$target" "$dry_run"
+}
+
+codex_home_dir() {
+  echo "${CODEX_HOME:-$HOME/.codex}"
+}
+
+# Print the distinct model_provider values present in the Codex state DB, one
+# per line. Used by shell completion for `ccs codex-sync-sessions <provider>`.
+codex_provider_values() {
+  local state_db
+  state_db="$(codex_home_dir)/state_5.sqlite"
+  [[ -f "$state_db" ]] || return 0
+  python3 - "$state_db" <<'PY' 2>/dev/null || true
+import sqlite3, sys
+try:
+    conn = sqlite3.connect(sys.argv[1])
+    for (p,) in conn.execute("SELECT DISTINCT model_provider FROM threads WHERE model_provider IS NOT NULL AND model_provider != ''"):
+        print(p)
+except Exception:
+    pass
+PY
+}
+
 # ── Main ──
 
 main() {
@@ -458,11 +597,20 @@ main() {
     --completion-rows)
       shift || true
       if [[ "${1:-}" == "--app" && -n "${2:-}" ]]; then
-        completion_rows "$2"
+        if [[ "$2" == "codex-sync-sessions" ]]; then
+          codex_provider_values
+        else
+          completion_rows "$2"
+        fi
       else
         completion_rows "claude"
       fi
       return 0
+      ;;
+    codex-sync-sessions)
+      shift || true
+      sync_codex_sessions "$@"
+      return $?
       ;;
   esac
 
@@ -481,6 +629,7 @@ main() {
       list_providers "$app_type"
       return 0
     fi
+
     query="$1"
   else
     # First arg is a provider name → backward compatible: treat as claude

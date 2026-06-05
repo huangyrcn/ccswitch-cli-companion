@@ -7,9 +7,9 @@ _ccs_bash_completion() {
   cword="$COMP_CWORD"
 
   if [[ "$cword" -eq 1 ]]; then
-    # First argument: app type keywords + claude provider names (backward compat)
+    # First argument: app type keywords + top-level commands + claude provider names
     local -a app_types
-    app_types=("claude" "codex")
+    app_types=("claude" "codex" "codex-sync-sessions")
     local name name_lc cur_lc escaped
 
     # Add app type keywords
@@ -38,6 +38,16 @@ _ccs_bash_completion() {
     # Second argument: check if first arg is an app type → complete providers for that app
     local prev="${COMP_WORDS[1]}"
     case "$prev" in
+      codex-sync-sessions)
+        # Complete with state-DB provider values + --dry-run flag
+        local opt
+        for opt in $(ccs --completion-rows --app codex-sync-sessions 2>/dev/null) --dry-run; do
+          if [[ "$opt" == "$cur"* ]]; then
+            COMPREPLY+=("$opt")
+          fi
+        done
+        return 0
+        ;;
       claude)
         local name name_lc cur_lc escaped
         cur_lc="$(printf '%s' "$cur" | tr '[:upper:]' '[:lower:]')"

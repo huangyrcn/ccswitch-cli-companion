@@ -17,7 +17,11 @@ fi
 
 _ccs() {
   local -a _ccs_app_types
-  _ccs_app_types=('claude:Launch with Claude provider' 'codex:Launch with Codex provider')
+  _ccs_app_types=(
+    'claude:Launch with Claude provider'
+    'codex:Launch with Codex provider'
+    'codex-sync-sessions:Flip Codex sessions (DB + JSONL) to a provider'
+  )
 
   if (( CURRENT == 2 )); then
     # First argument: app type keywords + claude provider names (backward compat)
@@ -41,6 +45,17 @@ _ccs() {
   if (( CURRENT == 3 )); then
     local word="${words[2]}"
     case "$word" in
+      codex-sync-sessions)
+        # Complete with state-DB provider values + --dry-run flag
+        local -a opts
+        local p
+        while IFS= read -r p; do
+          [[ -n "$p" ]] && opts+=("$p")
+        done < <(_ccs_rows codex-sync-sessions)
+        opts+=("--dry-run")
+        compadd -- "${opts[@]}"
+        return
+        ;;
       claude)
         # Complete claude provider names
         local -a names descriptions
